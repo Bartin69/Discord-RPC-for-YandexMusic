@@ -1,0 +1,6 @@
+pypresence
+yandex-music
+psutil
+pystray
+pillow
+winsdk
