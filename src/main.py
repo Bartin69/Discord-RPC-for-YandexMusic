@@ -8,11 +8,14 @@ def main():
 
     # Запуск RPC в отдельном потоке
     rpc_thread = threading.Thread(target=presence.start)
-    rpc_thread.daemon = True
+    rpc_thread.daemon = True  # Поток завершится, когда завершится основной поток
     rpc_thread.start()
 
     # Создание иконки в трее
     create_tray_icon(presence)
+
+    # Ожидание завершения потока (если нужно)
+    rpc_thread.join()
 
 if __name__ == '__main__':
     main()

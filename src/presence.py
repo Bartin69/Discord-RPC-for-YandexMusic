@@ -1,11 +1,11 @@
-import asyncio
 import time
 from enum import Enum
 from itertools import permutations
 from yandex_music import Client
 from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as MediaManager
 import pypresence
-from .utils import format_time, is_discord_running
+import psutil
+import asyncio
 
 # Идентификатор клиента Discord для Rich Presence
 client_id = '1191876731808784525'
@@ -25,26 +25,30 @@ class PlaybackStatus(Enum):
     Playing = 4
     Stopped = 5
 
-async def get_media_info():
+def get_media_info():
     """
     Получает информацию о текущем медиа-контенте через Windows SDK.
+    Использует asyncio.run для запуска асинхронного кода в синхронном контексте.
 
     :return: Словарь с информацией о треке или None, если информация недоступна.
     """
-    try:
-        sessions = await MediaManager.request_async()
-        current_session = sessions.get_current_session()
-        if current_session:
-            info = await current_session.try_get_media_properties_async()
-            info_dict = {song_attr: info.__getattribute__(song_attr) for song_attr in dir(info) if song_attr[0] != '_'}
-            info_dict['genres'] = list(info_dict['genres'])
-            playback_status = PlaybackStatus(current_session.get_playback_info().playback_status)
-            info_dict['playback_status'] = playback_status.name
-            return info_dict
-        raise Exception('The music is not playing right now.')
-    except Exception as e:
-        print(f"[WinYandexMusicRPC] -> Error getting media info: {e}")
-        return None
+    async def async_get_media_info():
+        try:
+            sessions = await MediaManager.request_async()
+            current_session = sessions.get_current_session()
+            if current_session:
+                info = await current_session.try_get_media_properties_async()
+                info_dict = {song_attr: info.__getattribute__(song_attr) for song_attr in dir(info) if song_attr[0] != '_'}
+                info_dict['genres'] = list(info_dict['genres'])
+                playback_status = PlaybackStatus(current_session.get_playback_info().playback_status)
+                info_dict['playback_status'] = playback_status.name
+                return info_dict
+            raise Exception('The music is not playing right now.')
+        except Exception as e:
+            print(f"[WinYandexMusicRPC] -> Error getting media info: {e}")
+            return None
+
+    return asyncio.run(async_get_media_info())
 
 class Presence:
     """Класс для управления Discord Rich Presence."""
@@ -60,66 +64,74 @@ class Presence:
 
     def start(self) -> None:
         """Запуск Rich Presence."""
+        # Создаем новый цикл событий для этого потока
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         if not is_discord_running():
             print("[WinYandexMusicRPC] -> Discord is not launched")
             return
 
-        # Создаем новый цикл событий для этого потока
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        try:
+            self.rpc = pypresence.Presence(client_id)
+            self.rpc.connect()
+            self.client = Client()
+            self.client.init()  # Синхронная инициализация
+            self.running = True
+            self.currentTrack = None
 
-        self.rpc = pypresence.Presence(client_id, loop=loop)
-        self.rpc.connect()
-        self.client = Client().init()
-        self.running = True
-        self.currentTrack = None
+            last_track_update_time = time.time()  # Время последнего обновления информации о треке
 
-        while self.running:
-            if not self.enabled:
-                self.rpc.clear()
-                time.sleep(1)
-                continue
+            while self.running:
+                if not self.enabled:
+                    self.rpc.clear()
+                    time.sleep(1)
+                    continue
 
-            currentTime = time.time()
+                current_time = time.time()
 
-            if not is_discord_running():
-                print("[WinYandexMusicRPC] -> Discord was closed")
-                self.running = False
-                return
+                if not is_discord_running():
+                    print("[WinYandexMusicRPC] -> Discord was closed")
+                    self.running = False
+                    return
 
-            ongoing_track = self._get_track()
+                # Обновляем информацию о треке каждые 10 секунд
+                if current_time - last_track_update_time >= 10:
+                    ongoing_track = self._get_track()
+                    last_track_update_time = current_time
+                else:
+                    ongoing_track = self.currentTrack  # Используем текущий трек, если обновление не требуется
 
-            # Проверяем, что ongoing_track не None
-            if ongoing_track is None:
-                print("[WinYandexMusicRPC] -> Failed to get track information")
-                time.sleep(1)
-                continue
+                # Проверяем, что ongoing_track не None
+                if ongoing_track is None:
+                    print("[WinYandexMusicRPC] -> Failed to get track information")
+                    time.sleep(1)
+                    continue
 
-            if self.currentTrack != ongoing_track:
-                self._update_track(ongoing_track, currentTime)
-            else:
-                self._update_time(ongoing_track, currentTime)
+                if self.currentTrack != ongoing_track:
+                    self._update_track(ongoing_track)
+                else:
+                    self._update_time(ongoing_track)
 
-            time.sleep(1)
+                time.sleep(1)  # Задержка для следующего обновления
 
-    def _update_track(self, track, current_time):
+        except Exception as e:
+            print(f"[WinYandexMusicRPC] -> Error in main loop: {e}")
+        finally:
+            if self.rpc:
+                self.rpc.close()
+
+    def _update_track(self, track):
         """Обновление информации о треке."""
         if track['success']:
-            self.track_start_time = current_time - track['current_position'] if track['current_position'] else current_time
-            self.start_time = self.track_start_time
-
-            elapsed_time = current_time - self.start_time
-            time_str = format_time(elapsed_time, track['durationSec'])
-
             try:
                 self.rpc.update(
-                    details=track['label'],
-                    state=time_str,
-                    large_image=track['og-image'],
-                    large_text=track['album'],
-                    small_image="play" if track["playback"] == PlaybackStatus.Playing.name else "pause",
-                    small_text="Playing" if track["playback"] == PlaybackStatus.Playing.name else "Paused",
-                    buttons=[{"label": "Listen on Yandex Music", "url": track['link']}]
+                    details=track['label'],  # Название трека и исполнителя
+                    large_image=track['og-image'],  # Обложка трека
+                    large_text=track['album'],  # Название альбома
+                    small_image="play" if track["playback"] == PlaybackStatus.Playing.name else "pause",  # Иконка воспроизведения/паузы
+                    small_text="Playing" if track["playback"] == PlaybackStatus.Playing.name else "Paused",  # Текст иконки
+                    buttons=[{"label": "Listen on Yandex Music", "url": track['link']}]  # Кнопка для прослушивания
                 )
             except Exception as e:
                 print(f"[WinYandexMusicRPC] -> Error updating RPC: {e}")
@@ -129,44 +141,39 @@ class Presence:
 
         self.currentTrack = track
 
-    def _update_time(self, track, current_time):
-        """Обновление времени трека."""
+    def _update_time(self, track):
+        """Обновление информации о треке (без времени)."""
         if track['success']:
-            elapsed_time = current_time - self.start_time
-            time_str = format_time(elapsed_time, track['durationSec'])
-
             if track["playback"] != PlaybackStatus.Playing.name and not self.paused:
                 self.paused = True
                 print(f"[WinYandexMusicRPC] -> Track {track['label']} on pause")
-                self._update_paused_track(track, time_str)
+                self._update_paused_track(track)
             elif track["playback"] == PlaybackStatus.Playing.name and self.paused:
                 print(f"[WinYandexMusicRPC] -> Track {track['label']} off pause.")
                 self.paused = False
 
             try:
                 self.rpc.update(
-                    details=track['label'],
-                    state=time_str,
-                    large_image=track['og-image'],
-                    large_text=track['album'],
-                    small_image="play" if track["playback"] == PlaybackStatus.Playing.name else "pause",
-                    small_text="Playing" if track["playback"] == PlaybackStatus.Playing.name else "Paused",
-                    buttons=[{"label": "Listen on Yandex Music", "url": track['link']}]
+                    details=track['label'],  # Название трека и исполнителя
+                    large_image=track['og-image'],  # Обложка трека
+                    large_text=track['album'],  # Название альбома
+                    small_image="play" if track["playback"] == PlaybackStatus.Playing.name else "pause",  # Иконка воспроизведения/паузы
+                    small_text="Playing" if track["playback"] == PlaybackStatus.Playing.name else "Paused",  # Текст иконки
+                    buttons=[{"label": "Listen on Yandex Music", "url": track['link']}]  # Кнопка для прослушивания
                 )
             except Exception as e:
                 print(f"[WinYandexMusicRPC] -> Error updating RPC: {e}")
 
-    def _update_paused_track(self, track, time_str):
-        """Обновление статуса при паузе."""
+    def _update_paused_track(self, track):
+        """Обновление статуса при паузе (без времени)."""
         try:
             self.rpc.update(
-                details=track['label'],
-                state=f"Paused | {time_str}",
-                large_image=track['og-image'],
-                large_text=track['album'],
-                small_image="pause",
-                small_text="Paused",
-                buttons=[{"label": "Listen on Yandex Music", "url": track['link']}]
+                details=track['label'],  # Название трека и исполнителя
+                large_image=track['og-image'],  # Обложка трека
+                large_text=track['album'],  # Название альбома
+                small_image="pause",  # Иконка паузы
+                small_text="Paused",  # Текст иконки
+                buttons=[{"label": "Listen on Yandex Music", "url": track['link']}]  # Кнопка для прослушивания
             )
         except Exception as e:
             print(f"[WinYandexMusicRPC] -> Error updating RPC: {e}")
@@ -174,7 +181,7 @@ class Presence:
     def _get_track(self) -> dict:
         """Получение информации о текущем треке."""
         try:
-            current_media_info = asyncio.run(get_media_info())
+            current_media_info = get_media_info()  # Синхронный вызов
             if not current_media_info:
                 print("[WinYandexMusicRPC] -> No media info available")
                 return {'success': False}
@@ -184,7 +191,7 @@ class Presence:
             global strong_find
             if str(name_current) != name_prev:
                 print("[WinYandexMusicRPC] -> Now listen: " + name_current)
-            else:  # Если песня уже играет, то не нужно ее искать повторно. Просто вернем её с актуальным статусом паузы.
+            else:  # Если песня уже играет, то не нужно её искать повторно. Просто вернем её с актуальным статусом паузы.
                 currentTrack_copy = self.currentTrack.copy()
                 currentTrack_copy["playback"] = current_media_info['playback_status']
                 return currentTrack_copy
@@ -234,3 +241,18 @@ class Presence:
         except Exception as exception:
             print(f"[WinYandexMusicRPC] -> Something happened: {exception}")
             return {'success': False}
+
+def is_discord_running():
+    """
+    Проверяет, запущен ли Discord.
+
+    :return: True, если Discord запущен, иначе False.
+    """
+    try:
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] == 'Discord.exe':
+                return True
+        return False
+    except Exception as e:
+        print(f"[WinYandexMusicRPC] -> Error checking Discord: {e}")
+        return False

@@ -1,5 +1,20 @@
 import psutil
 
+def is_discord_running():
+    """
+    Проверяет, запущен ли Discord.
+
+    :return: True, если Discord запущен, иначе False.
+    """
+    try:
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] == 'Discord.exe':
+                return True
+        return False
+    except Exception as e:
+        print(f"[WinYandexMusicRPC] -> Error checking Discord: {e}")
+        return False
+
 def format_time(current_time, total_time):
     """
     Форматирует время в виде "02:47 ______ 03:05".
@@ -16,11 +31,3 @@ def format_time(current_time, total_time):
     progress = int((current_time / total_time) * 10)  # 10 символов для прогресса
     progress_bar = "▬" * progress + " " * (10 - progress)  # Используем символы Unicode для прогресса
     return f"{current_str} {progress_bar} {total_str}"
-
-def is_discord_running():
-    """
-    Проверяет, запущен ли Discord.
-
-    :return: True, если Discord запущен, иначе False.
-    """
-    return "Discord.exe" in (p.name() for p in psutil.process_iter())
